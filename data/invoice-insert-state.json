@@ -1,0 +1,80 @@
+{
+  "195f448f99a7ec0a88679598808c4f697bccc382a4b73ee1bc3ff7e5517e2b37": {
+    "correlation_id": "188d968b4b6f466d86e99379eb366b2b",
+    "error": "Missing 'line_items' object in extracted JSON.",
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/188d968b4b6f466d86e99379eb366b2b.json",
+    "status": "FAILED"
+  },
+  "4439c02f5dcd87b0090287d70744c511753f23a0dc98c839e6b0250005f9911e": {
+    "correlation_id": "b150a16402c94f7da9950d70a2641c09",
+    "extracted_vendor_invoice_id": 8,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/b150a16402c94f7da9950d70a2641c09.json",
+    "status": "COMPLETED"
+  },
+  "4a4a5909219522d9b2f747f04af818acbf890129d34facb3777c59e90c561c79": {
+    "correlation_id": "79a54c1be6294b68b0cc3da232cc87f7",
+    "extracted_vendor_invoice_id": 11,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/79a54c1be6294b68b0cc3da232cc87f7.json",
+    "status": "COMPLETED"
+  },
+  "52b6b074de838d589e5ef85ac903b06a1bdbedb908a3a4fbf84ec3100632dcdd": {
+    "correlation_id": "0f88e71a26db4b4ea93a2958d3331574",
+    "extracted_vendor_invoice_id": 12,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/19/0f88e71a26db4b4ea93a2958d3331574.json",
+    "status": "COMPLETED"
+  },
+  "5440bcd07f3394ea15e7d75952e2bcf1f2da1f1aea4a27e06f22f60425941486": {
+    "correlation_id": "9f14f405a18e445ab8d1d2f761febbd9",
+    "error": "Database operation failed.",
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/9f14f405a18e445ab8d1d2f761febbd9.json",
+    "status": "FAILED"
+  },
+  "5721c724c876a9234a18d30b70edfab3bd4cbf66456329133d877ad68c7f1ea2": {
+    "correlation_id": "71d9d1a43eb541e2aaa575082fe21e36",
+    "extracted_vendor_invoice_id": 9,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/71d9d1a43eb541e2aaa575082fe21e36.json",
+    "status": "COMPLETED"
+  },
+  "889130c81890f9dd1358d9470af0fa0dffed10f2b6f2c1b4adf22f4dc82219b3": {
+    "correlation_id": "c6c60f4e9d224e748bc70052a1039334",
+    "error": "Database operation failed.",
+    "extracted_vendor_invoice_id": 6,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/c6c60f4e9d224e748bc70052a1039334.json",
+    "status": "COMPLETED"
+  },
+  "91f6d00c424fedec812bf518af782b3f365e945c5c3cddbe31a7d5cbe53f03ab": {
+    "correlation_id": "cf3a6cd73667490eaa24fb96002c5f75",
+    "extracted_vendor_invoice_id": 10,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/cf3a6cd73667490eaa24fb96002c5f75.json",
+    "status": "COMPLETED"
+  },
+  "982d1ad6014c57c5c90302602522091534e9450ec93656267d0d6d118e15959b": {
+    "correlation_id": "acd52202ba6d43889d796349327e4862",
+    "extracted_vendor_invoice_id": 13,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/19/acd52202ba6d43889d796349327e4862.json",
+    "status": "COMPLETED"
+  },
+  "a29bda61199bac3434985e159a33eb19811810682ab95900d529e10a07824071": {
+    "correlation_id": "196e1ddcbd2b46d09bf4efd368a42e7e",
+    "extracted_vendor_invoice_id": 7,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/18/196e1ddcbd2b46d09bf4efd368a42e7e.json",
+    "status": "COMPLETED"
+  },
+  "d0cdb883f07b351ae90fa7fc47c2c5326015b286d6585e7f97ae989c8c0bdc3a": {
+    "correlation_id": "cc3f3dd3b82a4c29aaa74f9dd26bd1c7",
+    "extracted_vendor_invoice_id": 14,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/19/cc3f3dd3b82a4c29aaa74f9dd26bd1c7.json",
+    "status": "COMPLETED"
+  }
+}

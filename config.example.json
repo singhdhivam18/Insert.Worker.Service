@@ -1,0 +1,39 @@
+{
+  "mailbox": {
+    "host": "imap.gmail.com",
+    "username": "invoices@example.com",
+    "password": "",
+    "port": 993,
+    "folder": "INBOX",
+    "use_ssl": true,
+    "mark_seen_after_success": true
+  },
+  "azure_blob": {
+    "account_name": "",
+    "account_key": "",
+    "container": "invoices",
+    "endpoint_suffix": "core.windows.net"
+  },
+  "rabbitmq": {
+    "host": "localhost",
+    "username": "",
+    "password": "",
+    "port": 5672,
+    "virtual_host": "/",
+    "queue": "invoice.raw",
+    "use_ssl": false
+  },
+  "database": {
+    "server": "",
+    "username": "",
+    "password": "",
+    "database": "",
+    "encrypt":""
+  },
+
+  "worker": {
+    "poll_interval_seconds": 60,
+    "state_file": "data/ingestion-state.json"
+  },
+  "logging": {"level": "INFO"}
+}
