@@ -17,10 +17,51 @@ ITEM_TABLE = "dbo.vendor_invoice_items_extracted"
 
 
 class JsonDataInserter:
-    """Persists extracted invoice data into SQL Server."""
+    """
+    Persists the current Worker-2 extraction JSON into SQL Server.
+
+    Expected input structure:
+
+    {
+        "correlation_id": "...",
+        "provider_type": "IMAP",
+        "file_path": "...",
+        "extracted_invoice_line_item": {
+            "success": true,
+            "data": {
+                "... invoice fields ...",
+                "line_items": [
+                    {
+                        "description": "...",
+                        "qty": 1,
+                        "unit_price": 100,
+                        "amount": 100,
+                        "hsn": "...",
+                        "tax_rate": 18,
+                        "t_nt": "T"
+                    }
+                ]
+            },
+            "processing_time_ms": 7880,
+            "model_used": "expense_rpt",
+            "pages": 1,
+            "extraction_id": "..."
+        }
+    }
+
+    Database behavior:
+
+        vendor_invoice_extracted
+                1
+                |
+                | 1 -> many
+                |
+        vendor_invoice_items_extracted
+    """
 
     DEFAULT_BRANCH_CODE = "BLR"
-
+    DEFAULT_COMP_CODE = "TPL"
+    DEFAULT_ACCT_YEAR = "2026-27"
     DEFAULT_PROCESSING_STAGE = "Extracted"
 
     def __init__(
@@ -41,14 +82,18 @@ class JsonDataInserter:
             )
 
         self.connection_string = connection_string
-    #PUBLIC INSERT
+
+    # =========================================================
+    # PUBLIC INSERT
+    # =========================================================
+
     def insert(
         self,
         extracted_json: dict[str, Any],
         requested_by: str = "invoice_insert_worker",
     ) -> int:
         """
-        Insert one invoice header and one invoice item.
+        Insert one invoice header and zero or more invoice items.
 
         Returns:
             Generated vendor_invoice_extracted.id
@@ -70,7 +115,11 @@ class JsonDataInserter:
             raise ValueError(
                 "requested_by cannot be empty."
             )
-        #Extract envelope values
+
+        # -----------------------------------------------------
+        # 1. Extract top-level envelope
+        # -----------------------------------------------------
+
         correlation_id = self._uuid(
             extracted_json.get("correlation_id")
         )
@@ -83,6 +132,8 @@ class JsonDataInserter:
             extracted_json.get("file_path")
         )
 
+        # These fields are not present in the current JSON,
+        # so preserve the existing application defaults.
         branch_code = self.DEFAULT_BRANCH_CODE
 
         comp_code = self._string(
@@ -95,7 +146,7 @@ class JsonDataInserter:
             )
 
         if comp_code is None:
-            comp_code = "TPL"
+            comp_code = self.DEFAULT_COMP_CODE
 
         acct_year = self._string(
             extracted_json.get("acct_year")
@@ -107,11 +158,37 @@ class JsonDataInserter:
             )
 
         if acct_year is None:
-            acct_year = "2026-27"
-        #Extract invoice data
-        invoice_data = self._get_invoice_data(
+            acct_year = self.DEFAULT_ACCT_YEAR
+
+        # -----------------------------------------------------
+        # 2. Extract provider response + actual invoice data
+        # -----------------------------------------------------
+
+        provider_response = self._get_provider_response(
             extracted_json
         )
+
+        invoice_data = self._get_invoice_data(
+            provider_response
+        )
+
+        line_items = self._get_line_items(
+            invoice_data
+        )
+
+        # -----------------------------------------------------
+        # 3. Validate provider success
+        # -----------------------------------------------------
+
+        success = provider_response.get("success")
+
+        if success is False:
+            error = provider_response.get("error")
+
+            raise ValueError(
+                "Invoice extraction failed: "
+                f"{error if error is not None else provider_response}"
+            )
 
         LOG.info(
             "database_invoice_data_prepared "
@@ -119,17 +196,23 @@ class JsonDataInserter:
             "provider_type=%s "
             "branch_code=%s "
             "comp_code=%s "
-            "acct_year=%s",
+            "acct_year=%s "
+            "line_item_count=%s",
             correlation_id,
             provider_type,
             branch_code,
             comp_code,
             acct_year,
+            len(line_items),
         )
-        #Build SQL
+
+        # -----------------------------------------------------
+        # 4. Build header INSERT
+        # -----------------------------------------------------
+
         header_sql, header_parameters = (
             self._build_header_insert(
-                extracted_json=extracted_json,
+                provider_response=provider_response,
                 invoice_data=invoice_data,
                 correlation_id=correlation_id,
                 acct_year=acct_year,
@@ -140,9 +223,13 @@ class JsonDataInserter:
             )
         )
 
+        # -----------------------------------------------------
+        # 5. Build item INSERT
+        # -----------------------------------------------------
+
         item_sql, item_parameters = (
             self._build_item_insert(
-                invoice_data
+                line_items=line_items,
             )
         )
 
@@ -150,7 +237,10 @@ class JsonDataInserter:
         cursor: pyodbc.Cursor | None = None
 
         try:
-            """connect"""
+            # -------------------------------------------------
+            # CONNECT
+            # -------------------------------------------------
+
             LOG.info(
                 "database_connecting"
             )
@@ -165,7 +255,11 @@ class JsonDataInserter:
             LOG.info(
                 "database_connected"
             )
-            """HEADER INSERT"""
+
+            # -------------------------------------------------
+            # HEADER INSERT
+            # -------------------------------------------------
+
             LOG.info(
                 "database_header_insert_started "
                 "table=%s "
@@ -178,7 +272,7 @@ class JsonDataInserter:
                 header_sql,
                 header_parameters,
             )
-            #OUTPUT INSERTED.id
+
             row = cursor.fetchone()
 
             if row is None:
@@ -199,7 +293,6 @@ class JsonDataInserter:
                 TypeError,
                 ValueError,
             ) as exc:
-
                 raise RuntimeError(
                     "Header insert returned an invalid "
                     "vendor invoice ID."
@@ -218,29 +311,54 @@ class JsonDataInserter:
                 vendor_invoice_id,
                 correlation_id,
             )
-            #ITEM INSERT
-            LOG.info(
-                "database_item_insert_started "
-                "table=%s "
-                "vendor_invoice_id=%s",
-                ITEM_TABLE,
-                vendor_invoice_id,
-            )
 
-            cursor.execute(
-                item_sql,
-                (
+            # -------------------------------------------------
+            # ITEM INSERTS
+            # -------------------------------------------------
+
+            if line_items:
+                LOG.info(
+                    "database_item_insert_started "
+                    "table=%s "
+                    "vendor_invoice_id=%s "
+                    "item_count=%s",
+                    ITEM_TABLE,
                     vendor_invoice_id,
-                    *item_parameters,
-                ),
-            )
+                    len(line_items),
+                )
 
-            LOG.info(
-                "database_item_insert_completed "
-                "vendor_invoice_id=%s",
-                vendor_invoice_id,
-            )
-            #commit
+                for index, parameters in enumerate(
+                    item_parameters,
+                    start=1,
+                ):
+                    cursor.execute(
+                        item_sql,
+                        (
+                            vendor_invoice_id,
+                            *parameters,
+                        ),
+                    )
+
+                    LOG.info(
+                        "database_item_insert_completed "
+                        "vendor_invoice_id=%s "
+                        "item_number=%s "
+                        "item_count=%s",
+                        vendor_invoice_id,
+                        index,
+                        len(line_items),
+                    )
+            else:
+                LOG.info(
+                    "database_no_line_items "
+                    "vendor_invoice_id=%s",
+                    vendor_invoice_id,
+                )
+
+            # -------------------------------------------------
+            # COMMIT
+            # -------------------------------------------------
+
             connection.commit()
 
             LOG.info(
@@ -288,24 +406,18 @@ class JsonDataInserter:
         finally:
 
             if cursor is not None:
-
                 try:
                     cursor.close()
-
                 except pyodbc.Error:
-
                     LOG.warning(
                         "database_cursor_close_failed",
                         exc_info=True,
                     )
 
             if connection is not None:
-
                 try:
                     connection.close()
-
                 except pyodbc.Error:
-
                     LOG.warning(
                         "database_connection_close_failed",
                         exc_info=True,
@@ -314,7 +426,11 @@ class JsonDataInserter:
             LOG.debug(
                 "database_connection_closed"
             )
-    """ROLL BACKs"""
+
+    # =========================================================
+    # ROLLBACK
+    # =========================================================
+
     @staticmethod
     def _rollback(
         connection: pyodbc.Connection | None,
@@ -325,7 +441,6 @@ class JsonDataInserter:
             return
 
         try:
-
             connection.rollback()
 
             LOG.warning(
@@ -335,38 +450,33 @@ class JsonDataInserter:
             )
 
         except pyodbc.Error:
-
             LOG.exception(
                 "database_rollback_failed"
             )
 
-    #extracted data
+    # =========================================================
+    # PROVIDER RESPONSE
+    # =========================================================
+
     @staticmethod
-    def _get_invoice_data(
+    def _get_provider_response(
         extracted_json: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Extract actual invoice object.
+        Extract:
 
-        Expected current structure:
+        extracted_json
+            -> extracted_invoice_line_item
 
-        {
-            "extracted_invoice_line_item": {
-                "line_items": {
-                    ...
-                }
-            }
-        }
+        from the current Worker-2 JSON.
         """
 
-        extracted_invoice_line_item = (
-            extracted_json.get(
-                "extracted_invoice_line_item"
-            )
+        provider_response = extracted_json.get(
+            "extracted_invoice_line_item"
         )
 
         if not isinstance(
-            extracted_invoice_line_item,
+            provider_response,
             dict,
         ):
             raise ValueError(
@@ -374,10 +484,27 @@ class JsonDataInserter:
                 "'extracted_invoice_line_item'."
             )
 
-        invoice_data = (
-            extracted_invoice_line_item.get(
-                "line_items"
-            )
+        return provider_response
+
+    # =========================================================
+    # INVOICE DATA
+    # =========================================================
+
+    @staticmethod
+    def _get_invoice_data(
+        provider_response: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Extract:
+
+        extracted_invoice_line_item
+            -> data
+
+        This is the actual DocXtract invoice object.
+        """
+
+        invoice_data = provider_response.get(
+            "data"
         )
 
         if not isinstance(
@@ -385,8 +512,9 @@ class JsonDataInserter:
             dict,
         ):
             raise ValueError(
-                "Missing or invalid 'line_items' "
-                "inside 'extracted_invoice_line_item'."
+                "Missing or invalid "
+                "'data' inside "
+                "'extracted_invoice_line_item'."
             )
 
         if not invoice_data:
@@ -396,10 +524,60 @@ class JsonDataInserter:
 
         return invoice_data
 
-    """Header Insert"""
+    # =========================================================
+    # LINE ITEMS
+    # =========================================================
+
+    @staticmethod
+    def _get_line_items(
+        invoice_data: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Extract the current DocXtract line_items array.
+        """
+
+        line_items = invoice_data.get(
+            "line_items"
+        )
+
+        if line_items is None:
+            return []
+
+        if not isinstance(
+            line_items,
+            list,
+        ):
+            raise ValueError(
+                "'line_items' must be a JSON array."
+            )
+
+        normalized_items: list[dict[str, Any]] = []
+
+        for index, item in enumerate(
+            line_items,
+            start=1,
+        ):
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                raise ValueError(
+                    f"line_items[{index}] must be "
+                    "a JSON object."
+                )
+
+            normalized_items.append(item)
+
+        return normalized_items
+
+    # =========================================================
+    # HEADER INSERT
+    # =========================================================
+
     def _build_header_insert(
         self,
-        extracted_json: dict[str, Any],
+        provider_response: dict[str, Any],
         invoice_data: dict[str, Any],
         correlation_id: uuid.UUID,
         acct_year: str,
@@ -408,34 +586,86 @@ class JsonDataInserter:
         file_path: str | None,
         requested_by: str,
     ) -> tuple[str, tuple[Any, ...]]:
-        """Build INSERT for vendor_invoice_extracted."""
+        """
+        Build INSERT for dbo.vendor_invoice_extracted.
+        """
 
         sql = f"""
         INSERT INTO {HEADER_TABLE}
         (
-            correlation_id,acct_year,branch_code,comp_code,module,vendor_name,vendor_address,vendor_gstin,
-            vendor_pan,vendor_state,vendor_registered,customer_name,customer_gstin,invoice_no,invoice_type,invoice_date,due_date,
-            document_year,csr_no,rcm_invoice_no,place_of_supply,location_of_supply,nature_of_supply,currency_code,sub_total,
-            tax_total,invoice_total,charge_type,tds_rate,tds_amount,tds_tax_amount,narration,total_pages,extraction_id,
-            model_used,processing_time_ms,confidence_score,document_path,processing_stage,total_cgst_amount,
-            total_sgst_amount,total_igst_amount,is_deleted,deleted_at,deleted_by,
-            created_by,modified_at,modified_by,is_ebv_created
+            correlation_id,
+            acct_year,
+            branch_code,
+            comp_code,
+            module,
+            vendor_name,
+            vendor_address,
+            vendor_gstin,
+            vendor_pan,
+            vendor_state,
+            vendor_registered,
+            customer_name,
+            customer_gstin,
+            invoice_no,
+            invoice_type,
+            invoice_date,
+            due_date,
+            document_year,
+            csr_no,
+            rcm_invoice_no,
+            place_of_supply,
+            location_of_supply,
+            nature_of_supply,
+            currency_code,
+            sub_total,
+            tax_total,
+            invoice_total,
+            charge_type,
+            tds_rate,
+            tds_amount,
+            tds_tax_amount,
+            narration,
+            total_pages,
+            extraction_id,
+            model_used,
+            processing_time_ms,
+            confidence_score,
+            document_path,
+            processing_stage,
+            total_cgst_amount,
+            total_sgst_amount,
+            total_igst_amount,
+            is_deleted,
+            deleted_at,
+            deleted_by,
+            created_by,
+            modified_at,
+            modified_by,
+            is_ebv_created
         )
         OUTPUT INSERTED.id
-        VALUES
-        (
-            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?
+        );
         """
 
         parameters = (
             # correlation_id
             correlation_id,
+
             # acct_year
             acct_year,
+
             # branch_code
             branch_code,
+
             # comp_code
             comp_code,
+
             # module
             self._string(
                 self._first(
@@ -443,6 +673,7 @@ class JsonDataInserter:
                     "module",
                 )
             ),
+
             # vendor_name
             self._string(
                 self._first(
@@ -452,6 +683,7 @@ class JsonDataInserter:
                     "supplier_name",
                 )
             ),
+
             # vendor_address
             self._string(
                 self._first(
@@ -460,15 +692,17 @@ class JsonDataInserter:
                     "supplier_address",
                 )
             ),
+
             # vendor_gstin
             self._string(
                 self._first(
                     invoice_data,
+                    "gstin",
                     "vendor_gstin",
                     "supplier_gstin",
-                    "gstin",
                 )
             ),
+
             # vendor_pan
             self._string(
                 self._first(
@@ -477,6 +711,7 @@ class JsonDataInserter:
                     "pan",
                 )
             ),
+
             # vendor_state
             self._string(
                 self._first(
@@ -485,30 +720,37 @@ class JsonDataInserter:
                     "supplier_state",
                 )
             ),
+
             # vendor_registered
             self._boolean(
                 self._first(
                     invoice_data,
+                    "is_registered",
                     "vendor_registered",
                     "supplier_registered",
                 )
             ),
+
             # customer_name
             self._string(
                 self._first(
                     invoice_data,
+                    "client_name",
                     "customer_name",
                     "buyer_name",
                 )
             ),
+
             # customer_gstin
             self._string(
                 self._first(
                     invoice_data,
+                    "client_gstin",
                     "customer_gstin",
                     "buyer_gstin",
                 )
             ),
+
             # invoice_no
             self._string(
                 self._first(
@@ -517,6 +759,7 @@ class JsonDataInserter:
                     "invoice_number",
                 )
             ),
+
             # invoice_type
             self._string(
                 self._first(
@@ -524,6 +767,7 @@ class JsonDataInserter:
                     "invoice_type",
                 )
             ),
+
             # invoice_date
             self._to_date(
                 self._first(
@@ -531,6 +775,7 @@ class JsonDataInserter:
                     "invoice_date",
                 )
             ),
+
             # due_date
             self._to_date(
                 self._first(
@@ -538,13 +783,16 @@ class JsonDataInserter:
                     "due_date",
                 )
             ),
+
             # document_year
             self._string(
                 self._first(
                     invoice_data,
+                    "doc_year",
                     "document_year",
                 )
             ),
+
             # csr_no
             self._string(
                 self._first(
@@ -552,6 +800,7 @@ class JsonDataInserter:
                     "csr_no",
                 )
             ),
+
             # rcm_invoice_no
             self._string(
                 self._first(
@@ -559,6 +808,7 @@ class JsonDataInserter:
                     "rcm_invoice_no",
                 )
             ),
+
             # place_of_supply
             self._string(
                 self._first(
@@ -566,17 +816,21 @@ class JsonDataInserter:
                     "place_of_supply",
                 )
             ),
+
             # location_of_supply
             self._string(
                 self._first(
                     invoice_data,
+                    "los",
                     "location_of_supply",
                 )
             ),
+
             # nature_of_supply
             self._string(
                 self._first(
                     invoice_data,
+                    "nos",
                     "nature_of_supply",
                 )
             ),
@@ -585,8 +839,8 @@ class JsonDataInserter:
             self._string(
                 self._first(
                     invoice_data,
-                    "currency_code",
                     "currency",
+                    "currency_code",
                 )
             ),
 
@@ -598,6 +852,7 @@ class JsonDataInserter:
                     "subtotal",
                 )
             ),
+
             # tax_total
             self._decimal(
                 self._first(
@@ -606,15 +861,18 @@ class JsonDataInserter:
                     "total_tax",
                 )
             ),
+
             # invoice_total
             self._decimal(
                 self._first(
                     invoice_data,
+                    "total",
                     "invoice_total",
                     "total_amount",
                     "grand_total",
                 )
             ),
+
             # charge_type
             self._string(
                 self._first(
@@ -622,6 +880,7 @@ class JsonDataInserter:
                     "charge_type",
                 )
             ),
+
             # tds_rate
             self._decimal(
                 self._first(
@@ -629,6 +888,7 @@ class JsonDataInserter:
                     "tds_rate",
                 )
             ),
+
             # tds_amount
             self._decimal(
                 self._first(
@@ -636,6 +896,7 @@ class JsonDataInserter:
                     "tds_amount",
                 )
             ),
+
             # tds_tax_amount
             self._decimal(
                 self._first(
@@ -643,6 +904,7 @@ class JsonDataInserter:
                     "tds_tax_amount",
                 )
             ),
+
             # narration
             self._string(
                 self._first(
@@ -650,85 +912,103 @@ class JsonDataInserter:
                     "narration",
                 )
             ),
+
             # total_pages
             self._integer(
                 self._first(
-                    invoice_data,
-                    "total_pages",
+                    provider_response,
+                    "pages",
                 )
             ),
+
             # extraction_id
             self._string(
                 self._first(
-                    extracted_json,
+                    provider_response,
                     "extraction_id",
                 )
             ),
+
             # model_used
             self._string(
                 self._first(
-                    extracted_json,
+                    provider_response,
                     "model_used",
                 )
             ),
+
             # processing_time_ms
             self._integer(
                 self._first(
-                    extracted_json,
+                    provider_response,
                     "processing_time_ms",
                 )
             ),
+
             # confidence_score
-            self._decimal(
-                self._first(
-                    extracted_json,
-                    "confidence_score",
-                )
-            ),
+            # Current DocXtract response does not provide it.
+            None,
+
             # document_path
             file_path,
+
             # processing_stage
             self.DEFAULT_PROCESSING_STAGE,
+
             # total_cgst_amount
             self._decimal(
                 self._first(
                     invoice_data,
+                    "Total CGST",
                     "total_cgst_amount",
                     "cgst_total",
                 )
             ),
+
             # total_sgst_amount
             self._decimal(
                 self._first(
                     invoice_data,
+                    "Total SGST Amount",
                     "total_sgst_amount",
                     "sgst_total",
                 )
             ),
+
             # total_igst_amount
             self._decimal(
                 self._first(
                     invoice_data,
+                    "Total IGST Amount",
                     "total_igst_amount",
                     "igst_total",
                 )
             ),
+
             # is_deleted
             False,
+
             # deleted_at
             None,
+
             # deleted_by
             None,
+
             # created_by
             requested_by,
+
             # modified_at
             None,
+
             # modified_by
             None,
+
             # is_ebv_created
             False,
         )
+
         placeholder_count = sql.count("?")
+
         if placeholder_count != len(parameters):
             raise RuntimeError(
                 "Header SQL parameter count mismatch: "
@@ -740,178 +1020,198 @@ class JsonDataInserter:
             "header_insert_parameter_count=%s",
             len(parameters),
         )
+
         return sql, parameters
-    """item insert"""
+
+    # =========================================================
+    # ITEM INSERT
+    # =========================================================
+
     def _build_item_insert(
         self,
-        invoice_data: dict[str, Any],
-    ) -> tuple[str, tuple[Any, ...]]:
+        line_items: list[dict[str, Any]],
+    ) -> tuple[
+        str,
+        list[tuple[Any, ...]],
+    ]:
         """
-        Build INSERT for vendor_invoice_items_extracted.
+        Build one parameter tuple for every line item.
 
-        vendor_invoice_id is intentionally excluded from the
-        parameters returned here.
+        Current DocXtract line-item fields:
 
-        insert() obtains the generated header ID and prepends it
-        before executing this SQL.
+            description
+            qty
+            unit_price
+            amount
+            hsn
+            tax_rate
+            t_nt
+
+        Current API does NOT provide line-item-specific:
+
+            cgst_percentage
+            cgst_amount
+            sgst_percentage
+            sgst_amount
+            igst_percentage
+            igst_amount
+            tax_amount
+            total_amount
+
+        Those fields therefore remain NULL rather than
+        inventing values.
         """
 
         sql = f"""
         INSERT INTO {ITEM_TABLE}
         (
-            vendor_invoice_id,description,quantity,unit_price,taxable_amount,hsn_code,tax_rate,t_nt,cgst_percentage,cgst_amount,
-            sgst_percentage,sgst_amount,igst_percentage,igst_amount,tax_amount,total_amount
+            vendor_invoice_id,
+            description,
+            quantity,
+            unit_price,
+            taxable_amount,
+            hsn_code,
+            tax_rate,
+            t_nt,
+            cgst_percentage,
+            cgst_amount,
+            sgst_percentage,
+            sgst_amount,
+            igst_percentage,
+            igst_amount,
+            tax_amount,
+            total_amount
         )
-        VALUES
-        (
-            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?
         );
         """
 
-        parameters = (
-            # description
-            self._string(
-                self._first(
-                    invoice_data,
-                    "description",
-                )
-            ),
+        parameters: list[tuple[Any, ...]] = []
 
-            # quantity
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "quantity",
-                )
-            ),
+        for index, item in enumerate(
+            line_items,
+            start=1,
+        ):
 
-            # unit_price
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "unit_price",
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"line_items[{index}] must be an object."
                 )
-            ),
 
-            # taxable_amount
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "taxable_amount",
-                )
-            ),
+            parameters.append(
+                (
+                    # description
+                    self._string(
+                        self._first(
+                            item,
+                            "description",
+                        )
+                    ),
 
-            # hsn_code
-            self._string(
-                self._first(
-                    invoice_data,
-                    "hsn_code",
-                    "hsn",
-                )
-            ),
+                    # quantity
+                    self._decimal(
+                        self._first(
+                            item,
+                            "qty",
+                            "quantity",
+                        )
+                    ),
 
-            # tax_rate
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "tax_rate",
-                )
-            ),
+                    # unit_price
+                    self._decimal(
+                        self._first(
+                            item,
+                            "unit_price",
+                        )
+                    ),
 
-            # t_nt
-            self._string(
-                self._first(
-                    invoice_data,
-                    "t_nt",
-                )
-            ),
+                    # taxable_amount
+                    #
+                    # Current DocXtract JSON provides
+                    # "amount". In the supplied sample:
+                    #
+                    # 286778 + 450 = 287228 subtotal
+                    #
+                    # therefore it is mapped to taxable_amount.
+                    self._decimal(
+                        self._first(
+                            item,
+                            "amount",
+                            "taxable_amount",
+                        )
+                    ),
 
-            # cgst_percentage
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "cgst_percentage",
-                )
-            ),
+                    # hsn_code
+                    self._string(
+                        self._first(
+                            item,
+                            "hsn",
+                            "hsn_code",
+                        )
+                    ),
 
-            # cgst_amount
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "cgst_amount",
-                )
-            ),
+                    # tax_rate
+                    self._decimal(
+                        self._first(
+                            item,
+                            "tax_rate",
+                        )
+                    ),
 
-            # sgst_percentage
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "sgst_percentage",
-                )
-            ),
+                    # t_nt
+                    self._string(
+                        self._first(
+                            item,
+                            "t_nt",
+                        )
+                    ),
 
-            # sgst_amount
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "sgst_amount",
-                )
-            ),
+                    # cgst_percentage
+                    None,
 
-            # igst_percentage
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "igst_percentage",
-                )
-            ),
+                    # cgst_amount
+                    None,
 
-            # igst_amount
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "igst_amount",
-                )
-            ),
+                    # sgst_percentage
+                    None,
 
-            # tax_amount
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "tax_amount",
-                )
-            ),
+                    # sgst_amount
+                    None,
 
-            # total_amount
-            self._decimal(
-                self._first(
-                    invoice_data,
-                    "total_amount",
+                    # igst_percentage
+                    None,
+
+                    # igst_amount
+                    None,
+
+                    # tax_amount
+                    None,
+
+                    # total_amount
+                    None,
                 )
-            ),
-        )
+            )
 
         placeholder_count = sql.count("?")
 
-        expected_count = len(parameters) + 1
-
-        if placeholder_count != expected_count:
+        if placeholder_count != 16:
             raise RuntimeError(
-                "Item SQL parameter count mismatch: "
-                f"SQL expects {placeholder_count}, "
-                f"parameters={expected_count}."
+                "Item SQL placeholder count mismatch: "
+                f"expected 16, got {placeholder_count}."
             )
 
         LOG.debug(
             "item_insert_parameter_count=%s",
-            expected_count,
+            len(parameters),
         )
 
         return sql, parameters
 
-    # ========================================================
+    # =========================================================
     # FIRST AVAILABLE VALUE
-    # ========================================================
+    # =========================================================
 
     @staticmethod
     def _first(
@@ -930,9 +1230,9 @@ class JsonDataInserter:
 
         return None
 
-    # ========================================================
+    # =========================================================
     # STRING
-    # ========================================================
+    # =========================================================
 
     @staticmethod
     def _string(
@@ -946,9 +1246,9 @@ class JsonDataInserter:
 
         return text if text else None
 
-    # ========================================================
+    # =========================================================
     # UUID
-    # ========================================================
+    # =========================================================
 
     @staticmethod
     def _uuid(
@@ -974,14 +1274,6 @@ class JsonDataInserter:
             )
 
         try:
-
-            # Handles both:
-            #
-            # c6c60f4e9d224e748bc70052a1039334
-            #
-            # and:
-            #
-            # c6c60f4e-9d22-4e74-8bc7-0052a1039334
             return uuid.UUID(text)
 
         except ValueError as exc:
@@ -990,9 +1282,9 @@ class JsonDataInserter:
                 f"Invalid correlation_id UUID: {value!r}"
             ) from exc
 
-    # ========================================================
+    # =========================================================
     # DECIMAL
-    # ========================================================
+    # =========================================================
 
     @staticmethod
     def _decimal(
@@ -1010,10 +1302,7 @@ class JsonDataInserter:
                 return None
 
         try:
-
-            return Decimal(
-                str(value)
-            )
+            return Decimal(str(value))
 
         except (
             InvalidOperation,
@@ -1024,7 +1313,11 @@ class JsonDataInserter:
             raise ValueError(
                 f"Invalid decimal value: {value!r}"
             ) from exc
-    """interger"""
+
+    # =========================================================
+    # INTEGER
+    # =========================================================
+
     @staticmethod
     def _integer(
         value: Any,
@@ -1041,7 +1334,6 @@ class JsonDataInserter:
                 return None
 
         try:
-
             return int(value)
 
         except (
@@ -1052,7 +1344,11 @@ class JsonDataInserter:
             raise ValueError(
                 f"Invalid integer value: {value!r}"
             ) from exc
-    #Boolean
+
+    # =========================================================
+    # BOOLEAN
+    # =========================================================
+
     @staticmethod
     def _boolean(
         value: Any,
@@ -1093,7 +1389,11 @@ class JsonDataInserter:
         raise ValueError(
             f"Invalid boolean value: {value!r}"
         )
-    """date"""
+
+    # =========================================================
+    # DATE
+    # =========================================================
+
     @staticmethod
     def _to_date(
         value: Any,
@@ -1120,19 +1420,13 @@ class JsonDataInserter:
             return None
 
         try:
-
-            return date.fromisoformat(
-                text
-            )
+            return date.fromisoformat(text)
 
         except ValueError:
             pass
 
         try:
-
-            return datetime.fromisoformat(
-                text
-            ).date()
+            return datetime.fromisoformat(text).date()
 
         except ValueError as exc:
 

@@ -41,6 +41,14 @@
     "result_blob_path": "extractions/2026/08/18/71d9d1a43eb541e2aaa575082fe21e36.json",
     "status": "COMPLETED"
   },
+  "709ef42d748e11831de4b841e4d878ec43a2dff40b6e23c6f48ee2bd37439322": {
+    "correlation_id": "f88d8b5f573b4954902ac90861e6d16c",
+    "error": "Header SQL parameter count mismatch: SQL expects 50, parameters=49.",
+    "extracted_vendor_invoice_id": 15,
+    "provider_type": "IMAP",
+    "result_blob_path": "extractions/2026/08/20/f88d8b5f573b4954902ac90861e6d16c.json",
+    "status": "COMPLETED"
+  },
   "889130c81890f9dd1358d9470af0fa0dffed10f2b6f2c1b4adf22f4dc82219b3": {
     "correlation_id": "c6c60f4e9d224e748bc70052a1039334",
     "error": "Database operation failed.",
